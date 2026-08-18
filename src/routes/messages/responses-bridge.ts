@@ -23,6 +23,8 @@ interface SSEStream {
   writeSSE(event: { data: string; event: string }): Promise<void>
 }
 
+const MIN_RESPONSES_OUTPUT_TOKENS = 16
+
 export function translateAnthropicMessagesToResponses(
   payload: AnthropicMessagesPayload,
   model: string,
@@ -33,7 +35,10 @@ export function translateAnthropicMessagesToResponses(
     model,
     input: payload.messages.flatMap((message) => translateMessage(message)),
     instructions: translateSystem(payload.system),
-    max_output_tokens: payload.max_tokens,
+    max_output_tokens: Math.max(
+      payload.max_tokens,
+      MIN_RESPONSES_OUTPUT_TOKENS,
+    ),
     temperature: payload.temperature,
     top_p: payload.top_p,
     reasoning: effort ? { effort } : undefined,
@@ -43,6 +48,10 @@ export function translateAnthropicMessagesToResponses(
       name: tool.name,
       description: tool.description,
       parameters: tool.input_schema,
+      // Anthropic tools allow optional and action-dependent fields. Copilot
+      // Responses defaults omitted strictness to true and rewrites every
+      // property as required, which makes multiplexed MCP schemas unusable.
+      strict: false,
     })),
     tool_choice: translateToolChoice(payload.tool_choice),
   }
@@ -58,6 +67,7 @@ export function translateResponsesToAnthropicMessage(
   const hitMaxTokens =
     response.status === "incomplete"
     && response.incomplete_details?.reason === "max_output_tokens"
+  const cachedTokens = response.usage?.input_tokens_details?.cached_tokens ?? 0
 
   return {
     id: response.id,
@@ -68,8 +78,12 @@ export function translateResponsesToAnthropicMessage(
     stop_reason: hitMaxTokens ? "max_tokens" : contentStopReason,
     stop_sequence: null,
     usage: {
-      input_tokens: response.usage?.input_tokens ?? 0,
+      input_tokens: Math.max(
+        0,
+        (response.usage?.input_tokens ?? 0) - cachedTokens,
+      ),
       output_tokens: response.usage?.output_tokens ?? 0,
+      ...(cachedTokens > 0 ? { cache_read_input_tokens: cachedTokens } : {}),
     },
   }
 }
