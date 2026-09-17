@@ -8,7 +8,10 @@ import { state } from "./state"
 const MAX_JSON_BODY_CHARS = 2_000_000
 const MAX_SSE_LINE_CHARS = 512_000
 const ROUTE_COLUMN_WIDTH = 26
-const MODEL_COLUMN_WIDTH = 14
+// Wide enough to distinguish every model this proxy maps to: `claude-sonnet-5`
+// and `claude-sonnet-4.6` both truncated to `claude-sonnet…` at 14, which hides
+// exactly what translateModelName() decided.
+const MODEL_COLUMN_WIDTH = 18
 const EFFORT_COLUMN_WIDTH = 7
 const TOKEN_COLUMN_WIDTH = 4
 const CACHE_COLUMN_WIDTH = 6 + TOKEN_COLUMN_WIDTH
@@ -48,6 +51,10 @@ interface FinishRequestLogOptions {
 
 type LogWriter = (line: string) => void
 
+/** Control characters (C0, DEL, C1) that could forge log lines or drive a terminal. */
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F-\u009F]/g
+
 const requestLogStates = new WeakMap<Context, RequestLogState>()
 
 export function setRequestLogMetadata(
@@ -85,6 +92,9 @@ export function createRequestLogMiddleware(
     }
 
     const response = c.res
+    const contentType = response.headers.get("content-type") ?? ""
+    const isEventStream = contentType.includes("text/event-stream")
+
     if (!response.body) {
       finishRequestLog({
         c,
@@ -95,10 +105,23 @@ export function createRequestLogMiddleware(
       return
     }
 
-    const observer = new ResponseMetricsObserver(
-      requestState,
-      response.headers.get("content-type") ?? "",
-    )
+    // Non-streaming responses are logged as soon as the handler returns, not
+    // when their body is drained. A body nobody reads — `HEAD /`, a client that
+    // hangs up, an internal `app.request()` — would otherwise never reach the
+    // observer's end-of-stream, and the request would vanish from the log
+    // entirely. hono/logger logged unconditionally; this preserves that.
+    if (!isEventStream) {
+      await collectBufferedMetrics(response, requestState, contentType)
+      finishRequestLog({
+        c,
+        requestState,
+        status: response.status,
+        writeLog,
+      })
+      return
+    }
+
+    const observer = new ResponseMetricsObserver(requestState, contentType)
     const reader = (response.body as ReadableStream<Uint8Array>).getReader()
     const observedBody = new ReadableStream<Uint8Array>({
       async pull(controller) {
@@ -152,6 +175,28 @@ export function createRequestLogMiddleware(
 }
 
 export const requestLogMiddleware = createRequestLogMiddleware()
+
+/**
+ * Read usage counts out of an already-buffered response. Cloning is cheap here
+ * because the body is fully in memory by the time the handler has returned, and
+ * it leaves the original untouched for the client.
+ */
+async function collectBufferedMetrics(
+  response: Response,
+  requestState: RequestLogState,
+  contentType: string,
+): Promise<void> {
+  try {
+    const body = await response.clone().text()
+    if (!body) return
+
+    const observer = new ResponseMetricsObserver(requestState, contentType)
+    observer.pushText(body)
+    observer.finish()
+  } catch (readError) {
+    consola.debug("Failed to read response body for metrics:", readError)
+  }
+}
 
 export function formatRequestLogLine(summary: RequestLogSummary): string {
   const request = `${summary.method} ${summary.path}`
@@ -209,6 +254,20 @@ class ResponseMetricsObserver {
 
   push(chunk: Uint8Array): void {
     const text = this.decoder.decode(chunk, { stream: true })
+    if (this.isEventStream) {
+      this.pushSSEText(text)
+      return
+    }
+
+    this.pushText(text)
+  }
+
+  /**
+   * Feed already-decoded text. Non-streaming responses take this path: their
+   * body is read once, in full, after the handler returns, so there is nothing
+   * to accumulate across chunks.
+   */
+  pushText(text: string): void {
     if (this.isEventStream) {
       this.pushSSEText(text)
       return
@@ -326,25 +385,33 @@ function finishRequestLog(options: FinishRequestLogOptions): void {
   requestState.finished = true
 
   const endedAtMs = performance.now()
-  const contextLimit = state.models?.data.find(
-    (model) => model.id === requestState.model,
-  )?.capabilities.limits.max_context_window_tokens
 
-  writeLog(
-    formatRequestLogLine({
-      method: c.req.method,
-      path: c.req.path,
-      status,
-      model: requestState.model,
-      effort: requestState.effort,
-      inputTokens: requestState.inputTokens,
-      outputTokens: requestState.outputTokens,
-      cachedTokens: requestState.cachedTokens,
-      contextLimit,
-      durationMs: endedAtMs - requestState.startedAtMs,
-      error,
-    }),
-  )
+  // Observability must never be able to break request handling. Callers run
+  // inside the response-body observer, where a throw would error the stream
+  // and hand the client a truncated body instead of its response.
+  try {
+    const contextLimit = state.models?.data.find(
+      (model) => model.id === requestState.model,
+    )?.capabilities.limits.max_context_window_tokens
+
+    writeLog(
+      formatRequestLogLine({
+        method: c.req.method,
+        path: c.req.path,
+        status,
+        model: requestState.model,
+        effort: requestState.effort,
+        inputTokens: requestState.inputTokens,
+        outputTokens: requestState.outputTokens,
+        cachedTokens: requestState.cachedTokens,
+        contextLimit,
+        durationMs: endedAtMs - requestState.startedAtMs,
+        error,
+      }),
+    )
+  } catch (logError) {
+    consola.debug("Failed to write request log line:", logError)
+  }
 }
 
 function nestedNumberValue(value: unknown, key: string): number | undefined {
@@ -359,9 +426,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
 
-function padColumn(value: string, width: number): string {
-  if (value.length <= width) return value.padEnd(width)
-  return `${value.slice(0, Math.max(1, width - 1))}…`
+/**
+ * Render an untrusted string into a fixed-width column.
+ *
+ * `model` and `effort` arrive from client JSON that is only structurally typed
+ * by a `c.req.json<T>()` cast, so at runtime they can be any JSON value. Three
+ * things have to hold regardless of what a client sends:
+ *
+ *   - Non-strings must not throw. An exception here escapes through the
+ *     response-body observer and destroys the client's response.
+ *   - Control characters must not survive. A newline would let a caller forge
+ *     an extra log line; an ESC would let it repaint the operator's terminal.
+ *   - Width is bounded by the column, so a huge string cannot flood the log.
+ */
+function padColumn(value: unknown, width: number): string {
+  const text = typeof value === "string" ? value : String(value)
+  const safe = text.replaceAll(CONTROL_CHARACTERS, "\u00b7")
+  if (safe.length <= width) return safe.padEnd(width)
+  return `${safe.slice(0, Math.max(1, width - 1))}…`
 }
 
 function formatStatus(status: number): string {

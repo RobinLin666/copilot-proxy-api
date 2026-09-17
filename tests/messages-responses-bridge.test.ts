@@ -207,7 +207,7 @@ describe("Messages Responses bridge", () => {
       expect(JSON.parse(opts.body as string)).toMatchObject({
         model: "gpt-5.5",
         input: [{ role: "user", content: "hello" }],
-        max_output_tokens: 16,
+        max_output_tokens: 100,
         stream: false,
         tools: [responsesNotebookTool],
       })
@@ -245,7 +245,7 @@ describe("Messages Responses bridge", () => {
       method: "POST",
       body: JSON.stringify({
         model: "gpt-5.5",
-        max_tokens: 1,
+        max_tokens: 100,
         messages: [{ role: "user", content: "hello" }],
         tools: [anthropicNotebookTool],
       }),

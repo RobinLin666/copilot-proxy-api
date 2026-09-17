@@ -23,8 +23,6 @@ interface SSEStream {
   writeSSE(event: { data: string; event: string }): Promise<void>
 }
 
-const MIN_RESPONSES_OUTPUT_TOKENS = 16
-
 export function translateAnthropicMessagesToResponses(
   payload: AnthropicMessagesPayload,
   model: string,
@@ -35,10 +33,11 @@ export function translateAnthropicMessagesToResponses(
     model,
     input: payload.messages.flatMap((message) => translateMessage(message)),
     instructions: translateSystem(payload.system),
-    max_output_tokens: Math.max(
-      payload.max_tokens,
-      MIN_RESPONSES_OUTPUT_TOKENS,
-    ),
+    // Forwarded verbatim. Silently raising a client's cap to a floor the proxy
+    // guesses upstream wants leaves the caller unable to reason about what it
+    // asked for; if Copilot rejects a small value, that rejection is the honest
+    // answer and reaches the client intact.
+    max_output_tokens: payload.max_tokens,
     temperature: payload.temperature,
     top_p: payload.top_p,
     reasoning: effort ? { effort } : undefined,
